@@ -457,25 +457,14 @@ async def upload_bank_statement(
     filename = file.filename or ""
     raw_text = await _get_raw_text(file)
 
-    # ── DEBUG: print raw extracted text to backend terminal ───────────────────
-    print(f"\n[WONDR DEBUG] Extracted {len(raw_text)} chars / "
-          f"{raw_text.count(chr(10))} lines from '{filename}'")
-    print("[WONDR DEBUG] RAW TEXT (first 2000 chars):")
-    print(raw_text[:2000])
-    print("[WONDR DEBUG] END RAW TEXT\n")
-
     parsed = _parse_bca_statement(raw_text)
     if not parsed:
-        # Graceful fallback — return 200 with zero imports so the frontend
-        # stays usable and the terminal log above shows what was extracted.
-        print(f"[WONDR DEBUG] Parser returned 0 transactions for '{filename}'.")
         return {
             "status": "no_data",
             "transactions_imported": 0,
             "message": (
                 "No transactions could be extracted from the file. "
-                "Check the backend terminal for the '[WONDR DEBUG] RAW TEXT' output "
-                "to inspect what was parsed."
+                "Ensure it is a BCA MutasiBCA PDF or plain-text export."
             ),
         }
 
@@ -525,10 +514,6 @@ async def parse_statement_only(file: UploadFile = File(...)):
     """
     filename = file.filename or ""
     raw_text = await _get_raw_text(file)
-
-    print(f"\n[WONDR DEBUG] parse-only: {len(raw_text)} chars from '{filename}'")
-    print(raw_text[:1000])
-    print("[WONDR DEBUG] END\n")
 
     parsed = _parse_bca_statement(raw_text)
     if not parsed:
