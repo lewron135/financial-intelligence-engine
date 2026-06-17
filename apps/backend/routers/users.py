@@ -1,3 +1,6 @@
+from datetime import datetime
+
+import pandas as pd
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -82,3 +85,127 @@ def get_user_summary(user_id: str, db: Session = Depends(get_db)):
             },
         },
     }
+
+
+@router.get("/{user_id}/transactions-annotated")
+def get_transactions_annotated(user_id: str, db: Session = Depends(get_db)):
+    from sklearn.ensemble import IsolationForest
+
+    transactions = (
+        db.query(Transaction)
+        .filter(Transaction.user_id == user_id)
+        .order_by(Transaction.timestamp)
+        .all()
+    )
+
+    base = [
+        {
+            "id": t.id,
+            "merchant_name": t.merchant_name,
+            "timestamp": t.timestamp.isoformat() if t.timestamp else datetime.now().isoformat(),
+            "amount": t.amount,
+            "category": t.category,
+            "is_anomaly": False,
+        }
+        for t in transactions
+    ]
+
+    if len(transactions) < 3:
+        return {"user_id": user_id, "transactions": base}
+
+    labels = IsolationForest(contamination=0.15, random_state=42).fit_predict(
+        [[t.amount] for t in transactions]
+    )
+
+    for item, label in zip(base, labels):
+        item["is_anomaly"] = bool(label == -1)
+
+    return {"user_id": user_id, "transactions": base}
+
+
+@router.get("/{user_id}/spending-forecast")
+def get_spending_forecast(user_id: str, db: Session = Depends(get_db)):
+    from prophet import Prophet
+
+    transactions = (
+        db.query(Transaction)
+        .filter(Transaction.user_id == user_id)
+        .order_by(Transaction.timestamp)
+        .all()
+    )
+
+    if not transactions:
+        return {"user_id": user_id, "historical": [], "forecast": []}
+
+    df = pd.DataFrame(
+        [
+            {
+                "ds": t.timestamp.date() if t.timestamp else datetime.now().date(),
+                "y": t.amount,
+            }
+            for t in transactions
+        ]
+    )
+    df["ds"] = pd.to_datetime(df["ds"])
+    df["week"] = df["ds"].dt.to_period("W").dt.start_time
+    weekly = df.groupby("week")["y"].sum().reset_index()
+    weekly.columns = ["ds", "y"]
+    weekly = weekly.sort_values("ds").reset_index(drop=True)
+
+    historical = [
+        {"period": row["ds"].strftime("%Y-%m-%d"), "amount": float(row["y"])}
+        for _, row in weekly.iterrows()
+    ]
+
+    if len(weekly) < 2:
+        return {"user_id": user_id, "historical": historical, "forecast": []}
+
+    model = Prophet(
+        yearly_seasonality=False, weekly_seasonality=False, daily_seasonality=False
+    )
+    model.fit(weekly)
+
+    future = model.make_future_dataframe(periods=4, freq="W")
+    forecast = model.predict(future)
+
+    last_date = weekly["ds"].max()
+    future_rows = forecast[forecast["ds"] > last_date]
+
+    forecast_data = [
+        {
+            "period": row["ds"].strftime("%Y-%m-%d"),
+            "amount": max(0.0, float(row["yhat"])),
+            "lower": max(0.0, float(row["yhat_lower"])),
+            "upper": max(0.0, float(row["yhat_upper"])),
+        }
+        for _, row in future_rows.iterrows()
+    ]
+
+    return {"user_id": user_id, "historical": historical, "forecast": forecast_data}
+
+
+@router.get("/{user_id}/daily-spending")
+def get_daily_spending(user_id: str, db: Session = Depends(get_db)):
+    transactions = (
+        db.query(Transaction).filter(Transaction.user_id == user_id).all()
+    )
+
+    daily: dict[str, dict[str, float]] = {}
+    for t in transactions:
+        date_str = (
+            t.timestamp.strftime("%Y-%m-%d")
+            if t.timestamp
+            else datetime.now().strftime("%Y-%m-%d")
+        )
+        if date_str not in daily:
+            daily[date_str] = {}
+        daily[date_str][t.category] = (
+            daily[date_str].get(t.category, 0.0) + t.amount
+        )
+
+    result = [
+        {"date": date, **categories}
+        for date, categories in sorted(daily.items())
+    ]
+
+    return {"user_id": user_id, "daily_spending": result}

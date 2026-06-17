@@ -22,7 +22,7 @@ YAHOO_HEADERS = {
 }
 
 _cache: Dict[str, Tuple[float, Any]] = {}
-CACHE_TTL = 300  # 5-minute cache for AI responses
+CACHE_TTL = 300  # 5-minute cache
 
 
 def _cache_get(key: str) -> Any | None:
@@ -103,7 +103,81 @@ def _macd(closes: List[float]) -> Tuple[Optional[float], Optional[float], Option
     )
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def _atr(
+    highs: List[Optional[float]],
+    lows: List[Optional[float]],
+    closes: List[float],
+    period: int = 14,
+) -> Optional[float]:
+    """Wilder's ATR: smoothed average of True Range.
+
+    Skips candles where high or low is None/zero — Yahoo Finance sometimes
+    returns null OHLCV for market holidays, and zero substitution would
+    corrupt the True Range calculation.
+    """
+    if len(closes) < period + 1 or not highs or not lows:
+        return None
+    true_ranges: List[float] = []
+    for i in range(1, len(closes)):
+        h, lo, prev_c = highs[i], lows[i], closes[i - 1]
+        if not h or not lo or prev_c == 0.0:
+            continue
+        true_ranges.append(max(h - lo, abs(h - prev_c), abs(lo - prev_c)))
+    if len(true_ranges) < period:
+        return None
+    atr = sum(true_ranges[:period]) / period
+    for tr in true_ranges[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return round(atr, 4)
+
+
+# ── Market & Pricing Helpers ──────────────────────────────────────────────────
+
+def _detect_market(symbol: str) -> str:
+    return "ID" if symbol.upper().endswith(".JK") else "US"
+
+
+def _round_price(value: float, market: str) -> float:
+    return round(value) if market == "ID" else round(value, 2)
+
+
+# ── Signal & Confidence ───────────────────────────────────────────────────────
+
+def _compute_signal_and_confidence(
+    rsi: Optional[float],
+    macd_hist: Optional[float],
+    price: float,
+    ma20: Optional[float],
+    ma50: Optional[float],
+) -> Tuple[str, int]:
+    """Score ranges 10–95. BUY ≥ 65, SELL ≤ 40, else HOLD."""
+    score = 50
+
+    if rsi is not None:
+        if rsi < 30:
+            score += 15   # deeply oversold
+        elif rsi < 50:
+            score += 10   # approaching oversold
+        elif rsi > 70:
+            score -= 15   # overbought
+        elif rsi > 60:
+            score -= 5
+
+    if macd_hist is not None:
+        score += 10 if macd_hist > 0 else -10
+
+    if ma20 is not None:
+        score += 10 if price > ma20 else -10
+
+    if ma50 is not None:
+        score += 10 if price > ma50 else -10
+
+    score = max(10, min(95, score))
+    signal = "BUY" if score >= 65 else ("SELL" if score <= 40 else "HOLD")
+    return signal, score
+
+
+# ── Misc Helper ───────────────────────────────────────────────────────────────
 
 def _fmt(d: dict, key: str) -> str:
     v = d.get(key, {})
@@ -117,7 +191,7 @@ def _fmt(d: dict, key: str) -> str:
 async def analyze_symbol(symbol: str):
     try:
         sym = symbol.upper()
-        cache_key = f"analysis:{sym}"
+        cache_key = f"quant_v1:{sym}"
         cached = _cache_get(cache_key)
         if cached is not None:
             return cached
@@ -148,16 +222,24 @@ async def analyze_symbol(symbol: str):
         result = chart_raw.get("chart", {}).get("result", [{}])[0]
         quote = result.get("indicators", {}).get("quote", [{}])[0]
         meta = result.get("meta", {})
+        timestamps: List[int] = result.get("timestamp", [])
 
         closes: List[float] = [c or 0.0 for c in (quote.get("close") or [])]
+        # Preserve None for missing H/L so _atr() can skip corrupt candles
+        highs: List[Optional[float]] = [(h if h and h > 0 else None) for h in (quote.get("high") or [])]
+        lows: List[Optional[float]] = [(lo if lo and lo > 0 else None) for lo in (quote.get("low") or [])]
+
         if not closes:
             raise HTTPException(status_code=404, detail=f"No chart data found for {sym}")
 
         # ── Indicators ────────────────────────────────────────────────────────
         rsi_val = _rsi(closes)
-        ma20 = next((v for v in reversed(_sma(closes, 20)) if v is not None), None)
-        ma50 = next((v for v in reversed(_sma(closes, 50)) if v is not None), None)
+        sma20_series = _sma(closes, 20)
+        sma50_series = _sma(closes, 50)
+        ma20 = next((v for v in reversed(sma20_series) if v is not None), None)
+        ma50 = next((v for v in reversed(sma50_series) if v is not None), None)
         macd_val, macd_sig, macd_hist = _macd(closes)
+        atr_val = _atr(highs, lows, closes, period=14)
 
         price: float = meta.get("regularMarketPrice") or closes[-1]
         prev_close: float = meta.get("previousClose") or meta.get("chartPreviousClose") or price
@@ -165,6 +247,31 @@ async def analyze_symbol(symbol: str):
         currency = meta.get("currency", "USD")
         high52 = meta.get("fiftyTwoWeekHigh", "N/A")
         low52 = meta.get("fiftyTwoWeekLow", "N/A")
+
+        # ── Market, TP, SL ────────────────────────────────────────────────────
+        market = _detect_market(sym)
+        take_profit: Optional[float] = None
+        cut_loss: Optional[float] = None
+        if atr_val is not None:
+            take_profit = _round_price(price + 3.0 * atr_val, market)
+            cut_loss = _round_price(price - 1.5 * atr_val, market)
+
+        # ── Signal & Confidence ───────────────────────────────────────────────
+        signal, confidence_score = _compute_signal_and_confidence(
+            rsi_val, macd_hist, price, ma20, ma50
+        )
+
+        # ── Chart Data (last 60 bars for frontend) ────────────────────────────
+        window = 60
+        start = max(0, len(closes) - window)
+        chart_data: List[Dict[str, Any]] = []
+        for i in range(start, len(closes)):
+            chart_data.append({
+                "date": timestamps[i] if i < len(timestamps) else None,
+                "close": round(closes[i], 4),
+                "ma20": round(sma20_series[i], 4) if sma20_series[i] is not None else None,
+                "ma50": round(sma50_series[i], 4) if sma50_series[i] is not None else None,
+            })
 
         # ── Fundamentals ──────────────────────────────────────────────────────
         qs_result = (fund_raw.get("quoteSummary") or {}).get("result") or [{}]
@@ -177,23 +284,42 @@ async def analyze_symbol(symbol: str):
         industry = profile.get("industry", "N/A")
         summary_blurb = (profile.get("longBusinessSummary") or "")[:600]
 
-        # ── Prompt ────────────────────────────────────────────────────────────
+        # ── Gemini Prompt ─────────────────────────────────────────────────────
         above_ma20 = "Above" if ma20 and price > ma20 else "Below"
         above_ma50 = "Above" if ma50 and price > ma50 else "Below"
 
-        prompt = f"""You are an expert Quantitative Analyst. I will provide you with live technical and fundamental data for a stock. Provide a structured, professional markdown analysis covering: 1. Technical Setup, 2. Fundamental Overview, 3. Bull/Bear Case, 4. Final Verdict. Base your analysis STRICTLY on the data provided.
+        quant_block = ""
+        if atr_val is not None:
+            quant_block = f"""
+### Quant Engine Risk Levels (ATR-Based — use these exact numbers in your explanation)
+- ATR 14-day: {atr_val:.2f} — this is the average daily price range (volatility proxy)
+- Take Profit: {take_profit} (= Price + 3.0 × ATR → 1:2 Risk-Reward target)
+- Cut Loss: {cut_loss} (= Price − 1.5 × ATR → 1.5× volatility buffer below price)
+- Algorithmic Signal: {signal} | Confidence: {confidence_score}/100
+"""
 
-## Stock: {sym} | {currency} | Sector: {sector} | Industry: {industry}
+        prompt = f"""You are the Wondr Quant Engine — an Explainable AI (XAI) financial analyst for retail investors in Indonesia and the US.
 
-### Technical Data
+Your job: write transparent, plain-language reasoning that explains WHY the computed signal and risk levels make sense, referencing only the data below. Structure your response in **markdown** with these sections:
+1. **Signal Rationale** — why BUY/HOLD/SELL based on RSI, MACD, and moving average alignment
+2. **Volatility Analysis** — explain what the ATR means in plain language and why the TP/SL levels are placed where they are
+3. **Bull Case** — key upside catalysts from the data
+4. **Bear Case** — key downside risks from the data
+5. **Key Risks** — one paragraph on what could invalidate this signal
+
+Do NOT invent numbers. Reference only what's provided. Be concise and educational.
+
+## Stock: {sym} | Currency: {currency} | Sector: {sector} | Industry: {industry}
+
+### Technical Snapshot
 - Current Price: {price:.2f} ({change_pct:+.2f}% today)
 - 52-Week Range: {low52} – {high52}
 - RSI (14): {rsi_val if rsi_val is not None else "N/A"}
-- MA20: {f"{ma20:.2f}" if ma20 else "N/A"} ({above_ma20} current price)
-- MA50: {f"{ma50:.2f}" if ma50 else "N/A"} ({above_ma50} current price)
-- MACD Line: {macd_val} | Signal: {macd_sig} | Histogram: {macd_hist}
-
-### Fundamental Data
+- MA20: {f"{ma20:.2f}" if ma20 else "N/A"} — price is {above_ma20} this level
+- MA50: {f"{ma50:.2f}" if ma50 else "N/A"} — price is {above_ma50} this level
+- MACD Line: {macd_val} | Signal Line: {macd_sig} | Histogram: {macd_hist}
+{quant_block}
+### Fundamental Snapshot
 - Market Cap: {_fmt(stats, "marketCap")}
 - Forward P/E: {_fmt(stats, "forwardPE")}
 - Trailing P/E: {_fmt(stats, "trailingPE")}
@@ -206,7 +332,7 @@ async def analyze_symbol(symbol: str):
 ### Business Summary
 {summary_blurb}
 
-Please provide your structured markdown analysis now:"""
+Provide your transparent AI reasoning now:"""
 
         # ── Gemini call ───────────────────────────────────────────────────────
         api_key = os.getenv("GEMINI_API_KEY")
@@ -216,14 +342,23 @@ Please provide your structured markdown analysis now:"""
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-2.5-flash")
         response = model.generate_content(prompt)
-        analysis_text: str = response.text
+        ai_reasoning: str = response.text
 
-        payload = {"symbol": sym, "analysis": analysis_text}
+        payload: Dict[str, Any] = {
+            "symbol": sym,
+            "current_price": _round_price(price, market),
+            "signal": signal,
+            "confidence_score": confidence_score,
+            "take_profit": take_profit,
+            "cut_loss": cut_loss,
+            "atr_volatility": round(atr_val, 2) if atr_val is not None else None,
+            "ai_reasoning": ai_reasoning,
+            "chart_data": chart_data,
+        }
         _cache_set(cache_key, payload)
         return payload
 
     except HTTPException:
-        # Let FastAPI handle its own HTTPExceptions as-is
         raise
     except Exception as e:
         traceback.print_exc()

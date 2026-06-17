@@ -91,3 +91,45 @@ export interface RecommendationsResponse {
   user_id: string;
   recommendations: GrowthRecommendation[];
 }
+
+export interface AnnotatedTransaction {
+  id: number;
+  merchant_name: string;
+  timestamp: string;
+  amount: number;
+  category: string;
+  is_anomaly: boolean;
+}
+
+export interface AnnotatedTransactionsResponse {
+  user_id: string;
+  transactions: AnnotatedTransaction[];
+}
+
+export interface SpendingForecastPeriod {
+  period: string;
+  amount: number;
+}
+
+export interface ForecastPeriod {
+  period: string;
+  amount: number;
+  lower: number;
+  upper: number;
+}
+
+export interface SpendingForecastResponse {
+  user_id: string;
+  historical: SpendingForecastPeriod[];
+  forecast: ForecastPeriod[];
+}
+
+export interface DailySpendingRow {
+  date: string;
+  [category: string]: string | number;
+}
+
+export interface DailySpendingResponse {
+  user_id: string;
+  daily_spending: DailySpendingRow[];
+}

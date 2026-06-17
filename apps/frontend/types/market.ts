@@ -67,6 +67,26 @@ export interface PortfolioHolding {
   quantity: number;
 }
 
+// ── Quant Engine API response ──────────────────────────────────────────────
+export interface QuantChartPoint {
+  date: number | null;
+  close: number;
+  ma20: number | null;
+  ma50: number | null;
+}
+
+export interface QuantAnalysis {
+  symbol: string;
+  current_price: number;
+  signal: "BUY" | "HOLD" | "SELL";
+  confidence_score: number;
+  take_profit: number | null;
+  cut_loss: number | null;
+  atr_volatility: number | null;
+  ai_reasoning: string;
+  chart_data: QuantChartPoint[];
+}
+
 export interface PortfolioSummary {
   cashBalance: number;
   holdings: PortfolioHolding[];

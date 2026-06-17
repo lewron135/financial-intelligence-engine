@@ -52,6 +52,7 @@ import type {
   Analysis,
   RecommendationLevel,
   PortfolioHolding,
+  QuantAnalysis,
 } from "@/types/market";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -1527,7 +1528,45 @@ function TickerSearchBar({ onAnalyze }: { onAnalyze: (symbol: string) => void })
   );
 }
 
-// ─── Analysis Modal ────────────────────────────────────────────────────────
+// ─── Quant Engine Modal ────────────────────────────────────────────────────
+
+const SIGNAL_STYLES = {
+  BUY:  { badge: "bg-emerald-100 text-emerald-800 border-emerald-200", bar: "bg-emerald-500" },
+  HOLD: { badge: "bg-amber-100 text-amber-800 border-amber-200",   bar: "bg-amber-500"   },
+  SELL: { badge: "bg-red-100 text-red-800 border-red-200",         bar: "bg-red-500"     },
+};
+
+function QuantTooltip({
+  active,
+  payload,
+  label,
+  currency,
+}: {
+  active?: boolean;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  payload?: any[];
+  label?: string;
+  currency: string;
+}) {
+  if (!active || !payload?.length) return null;
+  return (
+    <div className="bg-gray-950 border border-gray-800 rounded-xl shadow-xl p-3 text-xs min-w-[150px]">
+      <p className="font-semibold text-gray-400 mb-2">{label}</p>
+      {payload.map(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (p: any) =>
+          p.value != null && (
+            <div key={p.dataKey} className="flex justify-between gap-3">
+              <span style={{ color: p.color }}>{p.name}</span>
+              <span className="font-mono font-semibold text-white">
+                {typeof p.value === "number" ? fmtPrice(p.value, currency) : "—"}
+              </span>
+            </div>
+          )
+      )}
+    </div>
+  );
+}
 
 function AnalysisModal({
   symbol,
@@ -1537,114 +1576,366 @@ function AnalysisModal({
   onClose: () => void;
 }) {
   const [loading, setLoading] = useState(true);
-  const [text, setText] = useState<string | null>(null);
+  const [data, setData] = useState<QuantAnalysis | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     setLoading(true);
-    setText(null);
+    setData(null);
     setError(null);
     fetch(`${API_URL}/market/analyze/${encodeURIComponent(symbol)}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`)))
-      .then((d) => setText(d.analysis))
+      .then((d: QuantAnalysis) => setData(d))
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
   }, [symbol]);
 
-  // Close on Escape key
   useEffect(() => {
     const handler = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
   }, [onClose]);
 
+  // Derived chart values
+  const chartPoints = data?.chart_data.map((pt) => ({
+    ...pt,
+    label: pt.date
+      ? new Date(pt.date * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+      : "",
+  })) ?? [];
+
+  const isIDR = data?.symbol.endsWith(".JK") ?? false;
+  const currency = isIDR ? "IDR" : "USD";
+  const tickEvery = Math.max(1, Math.floor(chartPoints.length / 6));
+
+  const allPrices = chartPoints.map((p) => p.close);
+  const yMin = Math.min(...allPrices, data?.cut_loss ?? Infinity) * 0.985;
+  const yMax = Math.max(...allPrices, data?.take_profit ?? -Infinity) * 1.015;
+
+  const signalStyle = SIGNAL_STYLES[data?.signal ?? "HOLD"];
+
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[85vh] flex flex-col">
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+      <div className="bg-gray-950 rounded-2xl shadow-2xl w-full max-w-4xl max-h-[92vh] flex flex-col border border-gray-800">
+
+        {/* ── Header ─────────────────────────────────────────────────────── */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800 shrink-0">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 bg-gradient-to-br from-violet-500 to-indigo-600 rounded-xl flex items-center justify-center shadow-sm">
               <Sparkles className="w-4 h-4 text-white" />
             </div>
             <div>
-              <p className="font-black text-gray-900 tracking-tight">AI Analyst</p>
-              <p className="text-[10px] text-violet-500 font-semibold uppercase tracking-wide">
-                Gemini · {symbol}
+              <p className="font-black text-white tracking-tight">Quant Engine</p>
+              <p className="text-[10px] text-violet-400 font-semibold uppercase tracking-wide">
+                Gemini 2.5 Flash · {symbol} · Explainable AI
               </p>
             </div>
           </div>
           <button
             onClick={onClose}
-            className="w-8 h-8 flex items-center justify-center rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
+            className="w-8 h-8 flex items-center justify-center rounded-lg text-gray-500 hover:text-white hover:bg-gray-800 transition-colors"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
-        {/* Body */}
-        <div className="overflow-y-auto flex-1 px-6 py-5">
+        {/* ── Body ───────────────────────────────────────────────────────── */}
+        <div className="overflow-y-auto flex-1 px-6 py-5 space-y-5">
+
+          {/* Loading state */}
           {loading && (
-            <div className="flex flex-col items-center justify-center gap-4 py-16">
-              <div className="w-12 h-12 bg-violet-50 rounded-2xl flex items-center justify-center">
-                <Sparkles className="w-6 h-6 text-violet-500 animate-pulse" />
+            <div className="flex flex-col items-center justify-center gap-4 py-20">
+              <div className="w-14 h-14 bg-violet-950 rounded-2xl flex items-center justify-center border border-violet-800">
+                <Sparkles className="w-7 h-7 text-violet-400 animate-pulse" />
               </div>
               <div className="text-center">
-                <p className="text-sm font-semibold text-gray-700">Gemini AI is gathering data and analyzing the charts…</p>
-                <p className="text-xs text-gray-400 mt-1">Fetching live market data · Computing indicators · Generating analysis</p>
+                <p className="text-sm font-semibold text-gray-200">
+                  Running Quant Engine analysis…
+                </p>
+                <p className="text-xs text-gray-500 mt-1.5">
+                  Fetching OHLCV · Computing ATR · Calling Gemini AI
+                </p>
               </div>
               <RefreshCw className="w-4 h-4 text-violet-400 animate-spin" />
             </div>
           )}
 
+          {/* Error state */}
           {error && (
-            <div className="flex flex-col items-center gap-3 py-12">
+            <div className="flex flex-col items-center gap-3 py-16">
               <AlertTriangle className="w-8 h-8 text-red-400" />
-              <p className="text-sm font-semibold text-red-600">Analysis failed</p>
+              <p className="text-sm font-semibold text-red-400">Analysis failed</p>
               <p className="text-xs text-gray-500 text-center max-w-sm">{error}</p>
-              <p className="text-xs text-gray-400">Make sure the backend is running and the symbol is valid.</p>
+              <p className="text-xs text-gray-600">Ensure the backend is running and the symbol is valid.</p>
             </div>
           )}
 
-          {text && (
-            <div className="prose-analysis">
-              <ReactMarkdown
-                components={{
-                  h1: ({ children }) => <h1 className="text-xl font-black text-gray-900 mt-0 mb-3">{children}</h1>,
-                  h2: ({ children }) => <h2 className="text-base font-bold text-gray-900 mt-5 mb-2 pb-1 border-b border-gray-100">{children}</h2>,
-                  h3: ({ children }) => <h3 className="text-sm font-bold text-gray-800 mt-4 mb-1.5">{children}</h3>,
-                  p: ({ children }) => <p className="text-sm text-gray-600 leading-relaxed mb-3">{children}</p>,
-                  ul: ({ children }) => <ul className="space-y-1 mb-3 pl-4">{children}</ul>,
-                  ol: ({ children }) => <ol className="space-y-1 mb-3 pl-4 list-decimal">{children}</ol>,
-                  li: ({ children }) => <li className="text-sm text-gray-600 leading-relaxed list-disc">{children}</li>,
-                  strong: ({ children }) => <strong className="font-bold text-gray-900">{children}</strong>,
-                  em: ({ children }) => <em className="italic text-gray-700">{children}</em>,
-                  code: ({ children }) => <code className="bg-gray-100 px-1.5 py-0.5 rounded text-xs font-mono text-indigo-700">{children}</code>,
-                  blockquote: ({ children }) => (
-                    <blockquote className="border-l-4 border-violet-300 pl-4 my-3 bg-violet-50 py-2 rounded-r-lg text-sm text-gray-600 italic">
-                      {children}
-                    </blockquote>
-                  ),
-                  hr: () => <hr className="border-gray-100 my-4" />,
-                }}
-              >
-                {text}
-              </ReactMarkdown>
-            </div>
+          {data && (
+            <>
+              {/* ── Metric Strip ──────────────────────────────────────────── */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                {/* Current Price */}
+                <div className="bg-gray-900 rounded-xl border border-gray-800 p-4">
+                  <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-widest mb-1.5">
+                    Current Price
+                  </p>
+                  <p className="font-black text-white text-lg leading-none font-mono">
+                    {isIDR
+                      ? `Rp ${data.current_price.toLocaleString("id-ID")}`
+                      : `$${data.current_price.toFixed(2)}`}
+                  </p>
+                </div>
+
+                {/* Signal */}
+                <div className="bg-gray-900 rounded-xl border border-gray-800 p-4">
+                  <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-widest mb-1.5">
+                    Signal
+                  </p>
+                  <span
+                    className={`inline-block px-3 py-1 rounded-full text-sm font-black border tracking-tight ${signalStyle.badge}`}
+                  >
+                    {data.signal}
+                  </span>
+                </div>
+
+                {/* Confidence */}
+                <div className="bg-gray-900 rounded-xl border border-gray-800 p-4">
+                  <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-widest mb-1.5">
+                    Confidence
+                  </p>
+                  <p className="text-white font-black text-lg leading-none mb-2">
+                    {data.confidence_score}
+                    <span className="text-gray-500 text-xs font-normal ml-0.5">/100</span>
+                  </p>
+                  <div className="w-full bg-gray-800 rounded-full h-1.5">
+                    <div
+                      className={`h-1.5 rounded-full transition-all ${signalStyle.bar}`}
+                      style={{ width: `${data.confidence_score}%` }}
+                    />
+                  </div>
+                </div>
+
+                {/* ATR Volatility */}
+                <div className="bg-gray-900 rounded-xl border border-gray-800 p-4">
+                  <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-widest mb-1.5">
+                    ATR (14d)
+                  </p>
+                  <p className="font-black text-amber-400 text-lg leading-none font-mono">
+                    {data.atr_volatility != null
+                      ? (isIDR
+                        ? data.atr_volatility.toLocaleString("id-ID", { maximumFractionDigits: 0 })
+                        : data.atr_volatility.toFixed(2))
+                      : "—"}
+                  </p>
+                  <p className="text-[10px] text-gray-600 mt-1">avg daily range</p>
+                </div>
+              </div>
+
+              {/* ── TP / SL Levels ────────────────────────────────────────── */}
+              {(data.take_profit != null || data.cut_loss != null) && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="bg-emerald-950/50 rounded-xl border border-emerald-900 p-4 flex items-center gap-3">
+                    <div className="w-2 h-10 bg-emerald-500 rounded-full shrink-0" />
+                    <div>
+                      <p className="text-[10px] font-semibold text-emerald-500 uppercase tracking-widest">
+                        Take Profit · 1:2 R/R
+                      </p>
+                      <p className="font-black text-emerald-300 text-xl leading-none font-mono mt-0.5">
+                        {data.take_profit != null
+                          ? (isIDR
+                            ? `Rp ${data.take_profit.toLocaleString("id-ID")}`
+                            : `$${data.take_profit.toFixed(2)}`)
+                          : "—"}
+                      </p>
+                      <p className="text-[10px] text-emerald-700 mt-1">
+                        Price + 3.0 × ATR
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="bg-red-950/50 rounded-xl border border-red-900 p-4 flex items-center gap-3">
+                    <div className="w-2 h-10 bg-red-500 rounded-full shrink-0" />
+                    <div>
+                      <p className="text-[10px] font-semibold text-red-400 uppercase tracking-widest">
+                        Cut Loss · Volatility Buffer
+                      </p>
+                      <p className="font-black text-red-300 text-xl leading-none font-mono mt-0.5">
+                        {data.cut_loss != null
+                          ? (isIDR
+                            ? `Rp ${data.cut_loss.toLocaleString("id-ID")}`
+                            : `$${data.cut_loss.toFixed(2)}`)
+                          : "—"}
+                      </p>
+                      <p className="text-[10px] text-red-800 mt-1">
+                        Price − 1.5 × ATR
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Price Chart ───────────────────────────────────────────── */}
+              {chartPoints.length > 0 && (
+                <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
+                  <div className="px-4 pt-3.5 pb-1 flex items-center gap-2">
+                    <Layers className="w-3.5 h-3.5 text-gray-500" />
+                    <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-widest">
+                      Price Chart · MA20 · MA50 · TP/SL Levels
+                    </span>
+                  </div>
+                  <div className="px-1 pb-3">
+                    <ResponsiveContainer width="100%" height={230}>
+                      <ComposedChart data={chartPoints} margin={{ top: 8, right: 20, left: 0, bottom: 0 }}>
+                        <defs>
+                          <linearGradient id="quantPriceGrad" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%"  stopColor="#818cf8" stopOpacity={0.25} />
+                            <stop offset="95%" stopColor="#818cf8" stopOpacity={0}    />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid stroke="#1f2937" strokeDasharray="3 3" vertical={false} />
+                        <XAxis
+                          dataKey="label"
+                          tick={{ fontSize: 10, fill: "#4b5563" }}
+                          interval={tickEvery}
+                          axisLine={false}
+                          tickLine={false}
+                        />
+                        <YAxis
+                          domain={[yMin, yMax]}
+                          tickFormatter={(v: number) => fmtPrice(v, currency)}
+                          tick={{ fontSize: 9, fill: "#4b5563" }}
+                          axisLine={false}
+                          tickLine={false}
+                          width={isIDR ? 72 : 56}
+                        />
+                        <Tooltip content={<QuantTooltip currency={currency} />} />
+
+                        {/* TP / SL reference lines */}
+                        {data.take_profit != null && (
+                          <ReferenceLine
+                            y={data.take_profit}
+                            stroke="#10b981"
+                            strokeDasharray="5 3"
+                            strokeWidth={1.5}
+                            label={{
+                              value: `TP ${isIDR ? data.take_profit.toLocaleString("id-ID") : data.take_profit.toFixed(2)}`,
+                              position: "insideTopRight",
+                              fontSize: 9,
+                              fill: "#10b981",
+                              fontWeight: 700,
+                            }}
+                          />
+                        )}
+                        {data.cut_loss != null && (
+                          <ReferenceLine
+                            y={data.cut_loss}
+                            stroke="#ef4444"
+                            strokeDasharray="5 3"
+                            strokeWidth={1.5}
+                            label={{
+                              value: `SL ${isIDR ? data.cut_loss.toLocaleString("id-ID") : data.cut_loss.toFixed(2)}`,
+                              position: "insideBottomRight",
+                              fontSize: 9,
+                              fill: "#ef4444",
+                              fontWeight: 700,
+                            }}
+                          />
+                        )}
+
+                        {/* Price area */}
+                        <Area
+                          type="monotone"
+                          dataKey="close"
+                          name="Close"
+                          stroke="#818cf8"
+                          fill="url(#quantPriceGrad)"
+                          strokeWidth={2}
+                          dot={false}
+                          activeDot={{ r: 3, fill: "#818cf8" }}
+                        />
+
+                        {/* Moving averages */}
+                        <Line
+                          type="monotone"
+                          dataKey="ma20"
+                          name="MA20"
+                          stroke="#f59e0b"
+                          strokeWidth={1.5}
+                          dot={false}
+                          connectNulls={false}
+                        />
+                        <Line
+                          type="monotone"
+                          dataKey="ma50"
+                          name="MA50"
+                          stroke="#a78bfa"
+                          strokeWidth={1.5}
+                          dot={false}
+                          connectNulls={false}
+                        />
+                        <Legend
+                          iconType="line"
+                          iconSize={12}
+                          wrapperStyle={{ fontSize: 10, paddingTop: 4, color: "#6b7280" }}
+                        />
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              )}
+
+              {/* ── AI Reasoning ──────────────────────────────────────────── */}
+              <div className="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                <div className="flex items-center gap-2 mb-4">
+                  <div className="w-6 h-6 bg-violet-900 rounded-lg flex items-center justify-center">
+                    <Sparkles className="w-3.5 h-3.5 text-violet-400" />
+                  </div>
+                  <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-widest">
+                    AI Reasoning · Explainable Analysis
+                  </span>
+                </div>
+                <ReactMarkdown
+                  components={{
+                    h1: ({ children }) => <h1 className="text-base font-black text-white mt-0 mb-3">{children}</h1>,
+                    h2: ({ children }) => <h2 className="text-sm font-bold text-gray-200 mt-5 mb-2 pb-1 border-b border-gray-800">{children}</h2>,
+                    h3: ({ children }) => <h3 className="text-xs font-bold text-gray-300 mt-3 mb-1.5">{children}</h3>,
+                    p:  ({ children }) => <p className="text-sm text-gray-400 leading-relaxed mb-3">{children}</p>,
+                    ul: ({ children }) => <ul className="space-y-1 mb-3 pl-4">{children}</ul>,
+                    ol: ({ children }) => <ol className="space-y-1 mb-3 pl-4 list-decimal">{children}</ol>,
+                    li: ({ children }) => <li className="text-sm text-gray-400 leading-relaxed list-disc">{children}</li>,
+                    strong: ({ children }) => <strong className="font-bold text-gray-200">{children}</strong>,
+                    em:     ({ children }) => <em className="italic text-gray-400">{children}</em>,
+                    code:   ({ children }) => (
+                      <code className="bg-gray-800 px-1.5 py-0.5 rounded text-xs font-mono text-violet-400">
+                        {children}
+                      </code>
+                    ),
+                    blockquote: ({ children }) => (
+                      <blockquote className="border-l-4 border-violet-700 pl-4 my-3 bg-violet-950/40 py-2 rounded-r-lg text-sm text-gray-400 italic">
+                        {children}
+                      </blockquote>
+                    ),
+                    hr: () => <hr className="border-gray-800 my-4" />,
+                  }}
+                >
+                  {data.ai_reasoning}
+                </ReactMarkdown>
+              </div>
+            </>
           )}
         </div>
 
-        {/* Footer */}
-        <div className="px-6 py-3 border-t border-gray-50 flex items-center justify-between">
-          <p className="text-[10px] text-gray-400">
-            Powered by Gemini 1.5 Flash · For educational purposes only · Not financial advice
+        {/* ── Footer ─────────────────────────────────────────────────────── */}
+        <div className="px-6 py-3 border-t border-gray-800 flex items-center justify-between shrink-0">
+          <p className="text-[10px] text-gray-600">
+            Powered by Gemini 2.5 Flash · ATR-based TP/SL · For educational purposes only
           </p>
           <button
             onClick={onClose}
-            className="px-4 py-1.5 text-xs font-semibold text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
+            className="px-4 py-1.5 text-xs font-semibold text-gray-400 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors"
           >
             Close
           </button>
